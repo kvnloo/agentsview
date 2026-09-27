@@ -476,6 +476,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentTau,
 		AgentPrimeAgent,
 		AgentOMP,
+		AgentOMO,
 		AgentQwen,
 		AgentCommandCode,
 		AgentDeepSeekTUI,

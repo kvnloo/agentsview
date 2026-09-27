@@ -42,6 +42,7 @@ const (
 	AgentTau            AgentType = "tau"
 	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
+	AgentOMO            AgentType = "omo"
 	AgentQwen           AgentType = "qwen"
 	AgentCommandCode    AgentType = "commandcode"
 	AgentDeepSeekTUI    AgentType = "deepseek-tui"
@@ -555,6 +556,15 @@ var Registry = []AgentDef{
 		ConfigKey:   "omp_dirs",
 		DefaultDirs: []string{".omp/agent/sessions"},
 		IDPrefix:    "omp:",
+		FileBased:   true,
+	},
+	{
+		Type:        AgentOMO,
+		DisplayName: "OMO",
+		EnvVar:      "OMO_DIR",
+		ConfigKey:   "omo_dirs",
+		DefaultDirs: []string{".omo/agent/sessions"},
+		IDPrefix:    "omo:",
 		FileBased:   true,
 	},
 	{
