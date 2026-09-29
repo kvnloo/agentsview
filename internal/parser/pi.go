@@ -352,9 +352,6 @@ func parsePiLikeSession(
 	if (agent == AgentPrimeAgent || agent == AgentPi || agent == AgentOMO) && parentSessionID != "" {
 		sess.RelationshipType = RelFork
 	}
-	if agent == AgentOMO {
-		sess.Entrypoint = "pi-compatible"
-	}
 	if isOMPSubagent {
 		sess.RelationshipType = RelSubagent
 	}

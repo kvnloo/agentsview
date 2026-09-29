@@ -10,8 +10,10 @@ The latest published release is
 
 **New features**
 
-- Index OMO sessions from `~/.omo/agent/sessions` as agent `omo`, with
-  `entrypoint=pi-compatible`. They are not stored as Pi sessions.
+- Show OMO (oh-my-openagent) sessions as their own agent. AgentsView reads
+  them from `~/.omo/agent/sessions` with the Pi parser. Sessions you indexed
+  earlier by pointing `PI_DIR` at `~/.omo` stay labeled Pi; remove that
+  override so new OMO sessions are not indexed twice.
 - Push the local SQLite archive into ClickHouse and serve the read-only web UI
     from it. Configure `[clickhouse]` or named `[clickhouse.NAME]` targets, then
     run `agentsview clickhouse push`, `status`, `serve`, or `service`. Push
