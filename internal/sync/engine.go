@@ -12350,6 +12350,9 @@ func (e *Engine) processProviderFile(
 		}
 	}
 	applyProviderFingerprintFileInfo(file.Agent, fingerprint, outcome.Results)
+	settleLongUnresolvedCodexForks(
+		file.Agent, file.Path, fingerprint.MTimeNS, time.Now(), outcome.Results,
+	)
 	if codexFingerprintFromParse && fingerprint.Hash == "" {
 		// A completed parse captures the full source hash even when its pending
 		// calls cannot fit a persisted checkpoint.
