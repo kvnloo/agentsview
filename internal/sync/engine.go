@@ -13334,6 +13334,9 @@ func (e *Engine) processProviderFile(
 			ctx, stagedConfig, source, fingerprint, stagedSink,
 		)
 		if err == nil {
+			settleLongUnresolvedCodexForks(
+				file.Agent, file.Path, fingerprint.MTimeNS, time.Now(), outcome.Results,
+			)
 			outcome, err = admission.admitAll(outcome)
 		}
 	} else {
@@ -13343,7 +13346,13 @@ func (e *Engine) processProviderFile(
 			Machine:            machine,
 			ForceParse:         e.forceParseRequested(file),
 			StoredPathResolver: e.storedPathResolver,
-		}, admission.admit)
+		}, func(r parser.ParseResultOutcome) error {
+			one := []parser.ParseResultOutcome{r}
+			settleLongUnresolvedCodexForks(
+				file.Agent, file.Path, fingerprint.MTimeNS, time.Now(), one,
+			)
+			return admission.admit(one[0])
+		})
 	}
 	if err != nil && admission.validationErr == nil {
 		if stagedSink != nil {
