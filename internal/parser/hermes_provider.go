@@ -1591,6 +1591,9 @@ func hermesStateMemberFingerprint(
 			}
 		}
 	}
+	if h, selectedPath, ok := hermesStateMemberMarkerCore(ctx, src.StateDB, src.SessionID); ok {
+		return hermesStateMemberFingerprintFinish(source, src, h, selectedPath)
+	}
 	observeSharedContainerScan(ctx)
 	ss, messages, selectedPath, err := readHermesStateSessionSource(ctx,
 		src.StateDB, src.SessionID,
@@ -1709,15 +1712,19 @@ func seedHermesMemberCoresLocked(ctx context.Context, stateDB string) error {
 func cacheHermesMemberCore(
 	ctx context.Context, conn *sql.DB, stateDB, id, fingerprintKey string,
 ) error {
-	ss, messages, selectedPath, err := readHermesStateSessionSourceConn(ctx,
-		conn, stateDB, id,
-	)
-	if err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
-	}
-	h := sha256.New()
-	if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+	h, selectedPath, ok := hermesStateMemberMarkerCoreConn(ctx, conn, stateDB, id)
+	if !ok {
+		ss, messages, fullPath, err := readHermesStateSessionSourceConn(ctx,
+			conn, stateDB, id,
+		)
+		if err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		h = sha256.New()
+		if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		selectedPath = fullPath
 	}
 	marshaler, ok := h.(encoding.BinaryMarshaler)
 	if !ok {
@@ -1918,4 +1925,71 @@ func hermesProviderCapabilities() Capabilities {
 			FingerprintHashRequiredForFreshness: true,
 		},
 	}
+}
+
+// hermesStateMemberMarkerCore fingerprints one state.db member from change
+// markers instead of message content. Hermes bumps sessions.transcript_revision
+// (trigger messages_transcript_revision_update) on every in-place message
+// rewrite, appends move COUNT(*)/MAX(id), and the session row carries tokens,
+// cost, title and ended_at. Those are read from the sessions row plus a
+// covering index on messages, so an unchanged member costs a few index pages
+// rather than its whole transcript; before this, every sync of a live archive
+// re-read every message of every session to prove nothing changed.
+//
+// It returns ok=false (callers fall back to the content hash) when the
+// database predates transcript_revision or a JSON/JSONL transcript beside
+// state.db could be the selected source, since choosing between them needs the
+// messages.
+func hermesStateMemberMarkerCore(
+	ctx context.Context, stateDB, rawSessionID string,
+) (hash.Hash, string, bool) {
+	conn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
+	if err != nil {
+		return nil, "", false
+	}
+	defer conn.Close()
+	return hermesStateMemberMarkerCoreConn(ctx, conn, stateDB, rawSessionID)
+}
+
+func hermesStateMemberMarkerCoreConn(
+	ctx context.Context, conn *sql.DB, stateDB, rawSessionID string,
+) (hash.Hash, string, bool) {
+	sessionsDir := filepath.Join(filepath.Dir(stateDB), "sessions")
+	if IsRegularFile(filepath.Join(sessionsDir, "session_"+rawSessionID+".json")) ||
+		IsRegularFile(filepath.Join(sessionsDir, rawSessionID+".jsonl")) {
+		return nil, "", false
+	}
+	var revision sql.NullInt64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT transcript_revision FROM sessions WHERE id = ?`, rawSessionID,
+	).Scan(&revision); err != nil || !revision.Valid {
+		return nil, "", false // no such column, no row, or NULL: use the content hash
+	}
+	ss, found, err := readHermesStateSession(ctx, conn, rawSessionID)
+	if err != nil || !found {
+		return nil, "", false
+	}
+	var count, maxID int64
+	var tsSum float64
+	if err := conn.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(timestamp), 0)
+		FROM messages WHERE session_id = ?`, rawSessionID,
+	).Scan(&count, &maxID, &tsSum); err != nil {
+		return nil, "", false
+	}
+	h := sha256.New()
+	if _, err := fmt.Fprintf(h,
+		"state-member-marker-v1\x00%q\x00%q\x00%q\x00%q\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%t\x00%g\x00%t\x00%g\x00%q\x00%q\x00%q\x00%d\x00%d\x00%d\x00%g\x00",
+		ss.id, ss.source, ss.model, ss.parentSessionID,
+		ss.startedAt.UnixNano(), ss.endedAt.UnixNano(), ss.messageCount,
+		ss.inputTokens, ss.outputTokens, ss.cacheReadTokens,
+		ss.cacheWriteTokens, ss.reasoningTokens, ss.apiCallCount,
+		ss.estimatedCost.Valid, ss.estimatedCost.Float64,
+		ss.actualCost.Valid, ss.actualCost.Float64,
+		ss.costStatus, ss.costSource, ss.title,
+		revision.Int64, count, maxID, tsSum,
+	); err != nil {
+		return nil, "", false
+	}
+	return h, stateDB, true
 }
