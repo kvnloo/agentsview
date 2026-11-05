@@ -1922,6 +1922,9 @@ func hermesStateMemberFingerprint(
 		return SourceFingerprint{}, hermesStateLookupError{err: fmt.Errorf("open hermes state db: %w", err)}
 	}
 	defer conn.Close()
+	if h, ok := hermesStateMemberMarkerHash(ctx, conn, src.StateDB, src.SessionID); ok {
+		return hermesStateMemberFingerprintFinish(source, src, h, nil)
+	}
 	ss, messages, candidatePaths, err := readHermesStateSessionFingerprintInputs(
 		ctx,
 		conn, src.StateDB, src.SessionID,
@@ -2076,19 +2079,24 @@ func seedHermesMemberCoresLocked(ctx context.Context, stateDB string) error {
 func cacheHermesMemberCore(
 	ctx context.Context, conn *sql.DB, stateDB, id, fingerprintKey string,
 ) error {
-	ss, messages, candidatePaths, err := readHermesStateSessionFingerprintInputs(
-		ctx,
-		conn, stateDB, id,
-	)
-	if err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
-	}
-	if err := resolveHermesStateCronJobConn(ctx, conn, &ss); err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
-	}
-	h := sha256.New()
-	if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+	h, ok := hermesStateMemberMarkerHash(ctx, conn, stateDB, id)
+	var candidatePaths []string
+	if !ok {
+		ss, messages, paths, err := readHermesStateSessionFingerprintInputs(
+			ctx,
+			conn, stateDB, id,
+		)
+		if err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		if err := resolveHermesStateCronJobConn(ctx, conn, &ss); err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		h = sha256.New()
+		if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		candidatePaths = paths
 	}
 	marshaler, ok := h.(encoding.BinaryMarshaler)
 	if !ok {
@@ -2318,4 +2326,56 @@ func hermesProviderCapabilities() Capabilities {
 			MemberFreshnessOverridesFileForce:   true,
 		},
 	}
+}
+
+// hermesStateMemberMarkerHash fingerprints one state.db member from change
+// markers instead of its message content. Current Hermes bumps
+// sessions.transcript_revision (trigger messages_transcript_revision_update) on
+// every in-place message rewrite; appends and deletes move COUNT(*)/MAX(id)
+// over a covering index; and the session row (tokens, cost, title, ended_at,
+// cron job) is hashed as before. An unchanged member then costs one row and a
+// few index pages instead of its whole transcript, so a sync of a live
+// archive reads only what changed.
+//
+// ok=false (callers keep the content hash) when the database predates
+// transcript_revision, or a JSON/JSONL transcript beside state.db could be the
+// selected source, since choosing between them compares the messages.
+func hermesStateMemberMarkerHash(
+	ctx context.Context, conn *sql.DB, stateDB, rawSessionID string,
+) (hash.Hash, bool) {
+	sessionsDir := filepath.Join(filepath.Dir(stateDB), "sessions")
+	if IsRegularFile(filepath.Join(sessionsDir, "session_"+rawSessionID+".json")) ||
+		IsRegularFile(filepath.Join(sessionsDir, rawSessionID+".jsonl")) {
+		return nil, false
+	}
+	var revision sql.NullInt64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT transcript_revision FROM sessions WHERE id = ?`, rawSessionID,
+	).Scan(&revision); err != nil || !revision.Valid {
+		return nil, false
+	}
+	ss, found, err := readHermesStateSession(ctx, conn, rawSessionID)
+	if err != nil || !found {
+		return nil, false
+	}
+	if err := resolveHermesStateCronJobConn(ctx, conn, &ss); err != nil {
+		return nil, false
+	}
+	var count, maxID int64
+	var tsSum float64
+	if err := conn.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(timestamp), 0)
+		FROM messages WHERE session_id = ?`, rawSessionID,
+	).Scan(&count, &maxID, &tsSum); err != nil {
+		return nil, false
+	}
+	h := sha256.New()
+	if _, err := fmt.Fprintf(h, "state-member-marker-v1\x00%d\x00%d\x00%d\x00%g\x00",
+		revision.Int64, count, maxID, tsSum); err != nil {
+		return nil, false
+	}
+	if err := addHermesStateSessionFingerprint(h, ss, nil); err != nil {
+		return nil, false
+	}
+	return h, true
 }
