@@ -1157,6 +1157,9 @@ func (hs RemoteSync) prepareMirror(
 	if err := RemoveMirrorTypeConflicts(mirrorRoot, delta.Fetch); err != nil {
 		return nil, err
 	}
+	// Changed SQLite databases go over sqlite3_rsync (changed pages only);
+	// the rest, and any database it could not refresh, use the archive.
+	delta.Fetch = hs.rsyncSQLiteSnapshots(ctx, targets.dirScoped, delta.Fetch, manifest, mirrorRoot)
 	if len(delta.Fetch) > 0 {
 		full := len(delta.Fetch) == delta.Total
 		err := hs.downloadIntoMirror(
