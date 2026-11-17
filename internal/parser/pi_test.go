@@ -1166,3 +1166,19 @@ func TestPiProviderParsesNoUsageNoTokenUsage(t *testing.T) {
 	assert.Empty(t, msgs[0].TokenUsage,
 		"token usage left empty when message.usage absent")
 }
+
+// TestPiProviderOMPPathParentSessionResolvesToHeaderID covers OMP transcripts
+// whose parentSession is the parent's file path (seen in live omp sessions):
+// the parent must be the parent's header ID, not "omp:<path>".
+func TestPiProviderOMPPathParentSessionResolvesToHeaderID(t *testing.T) {
+	dir := t.TempDir()
+	parentPath := filepath.Join(dir, "2026-10-24T18-59-09-096Z_parent-abc.jsonl")
+	require.NoError(t, os.WriteFile(parentPath, []byte(`{"type":"session","version":3,"id":"parent-abc","timestamp":"2026-10-24T18:59:09.096Z","cwd":"/repos/x"}`+"\n"), 0o644))
+	childContent := strings.Join([]string{
+		`{"type":"session","version":3,"id":"child-def","timestamp":"2026-10-24T21:46:34.674Z","cwd":"/repos/x","parentSession":"` + parentPath + `"}`,
+		`{"type":"message","id":"c1","parentId":null,"timestamp":"2026-10-24T21:46:35.000Z","message":{"role":"user","content":"hi"}}`,
+		"",
+	}, "\n")
+	child, _ := parsePiLikeTestSession(t, AgentOMP, childContent)
+	assert.Equal(t, "omp:parent-abc", child.ParentSessionID)
+}

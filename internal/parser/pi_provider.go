@@ -326,7 +326,11 @@ func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
 			WithIncludePath(isOMPSourcePath),
 			WithProjectHint(func(root, path string) string { return "" }),
 			WithSessionIDFromPath(piSessionIDFromPath),
-			WithContentHashing(),
+			// OMP sessions are completed, immutable transcripts: fingerprint by
+			// stat (size/mtime/inode) so unchanged sessions are not re-read on
+			// every sync. WithContentHashing() re-read every session file
+			// (697 files, multi-GB) even when nothing changed. The destination
+			// file_hash column is left intact.
 		)
 	}
 	return NewDirectoryJSONLSourceSet(agent, roots,

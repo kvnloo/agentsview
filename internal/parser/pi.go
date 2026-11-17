@@ -99,8 +99,11 @@ func parsePiLikeSession(
 	} else if parentSession := gjson.Get(headerLine, "parentSession").Str; parentSession != "" &&
 		(agent == AgentPi || agent == AgentOMP || agent == AgentPrimeAgent ||
 			agent == AgentOMO || agent == AgentStepCode) {
+		// OMP usually records a raw ID, but some versions record the parent
+		// transcript path. Resolve a path to the parent's header ID like Pi,
+		// or the stored parent ("omp:/home/...jsonl") matches no session.
 		if agent == AgentPrimeAgent || agent == AgentPi || agent == AgentOMO ||
-			agent == AgentStepCode {
+			agent == AgentStepCode || agent == AgentOMP && piParentIsPath(parentSession) {
 			parentSession = primeParentSessionID(path, parentSession)
 		}
 		parentSessionID = idPrefix + parentSession
@@ -383,6 +386,12 @@ func parsePiLikeSession(
 // the parent with no parentSession, so the ID prefix is the only marker.
 func isStepCodeChildSessionID(id string) bool {
 	return strings.HasPrefix(id, "subagent-") || strings.HasPrefix(id, "workflow-")
+}
+
+// piParentIsPath reports whether a parentSession value is a transcript path
+// rather than a raw session ID.
+func piParentIsPath(value string) bool {
+	return strings.ContainsAny(value, `/\\`) || strings.HasSuffix(value, ".jsonl")
 }
 
 func piPersistedPathSessionID(value string) string {
