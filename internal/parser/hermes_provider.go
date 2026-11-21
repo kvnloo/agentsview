@@ -1922,6 +1922,11 @@ func hermesStateMemberFingerprint(
 		return SourceFingerprint{}, hermesStateLookupError{err: fmt.Errorf("open hermes state db: %w", err)}
 	}
 	defer conn.Close()
+	if h, candidatePaths, ok := hermesStateMemberMarkerCoreConn(
+		ctx, conn, src.StateDB, src.SessionID,
+	); ok {
+		return hermesStateMemberFingerprintFinish(source, src, h, candidatePaths)
+	}
 	ss, messages, candidatePaths, err := readHermesStateSessionFingerprintInputs(
 		ctx,
 		conn, src.StateDB, src.SessionID,
@@ -2076,19 +2081,23 @@ func seedHermesMemberCoresLocked(ctx context.Context, stateDB string) error {
 func cacheHermesMemberCore(
 	ctx context.Context, conn *sql.DB, stateDB, id, fingerprintKey string,
 ) error {
-	ss, messages, candidatePaths, err := readHermesStateSessionFingerprintInputs(
-		ctx,
-		conn, stateDB, id,
-	)
-	if err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
-	}
-	if err := resolveHermesStateCronJobConn(ctx, conn, &ss); err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
-	}
-	h := sha256.New()
-	if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
-		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+	h, candidatePaths, ok := hermesStateMemberMarkerCoreConn(ctx, conn, stateDB, id)
+	if !ok {
+		ss, messages, fullCandidates, err := readHermesStateSessionFingerprintInputs(
+			ctx,
+			conn, stateDB, id,
+		)
+		if err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		if err := resolveHermesStateCronJobConn(ctx, conn, &ss); err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		h = sha256.New()
+		if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
+			return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+		}
+		candidatePaths = fullCandidates
 	}
 	marshaler, ok := h.(encoding.BinaryMarshaler)
 	if !ok {
