@@ -528,7 +528,12 @@ func (hs RemoteSync) prepare(
 	diff := newMirrorDiff(mirrorRoot)
 	defer func() { err = errors.Join(err, diff.close()) }()
 	manifestStarted := time.Now()
+	snapshotTargets := sqliteSnapshotTargets(dirScoped)
+	snapshotEntries := make(map[string]ManifestEntry, len(snapshotTargets))
 	supported, err := hs.Source.Manifest(ctx, dirScoped, func(entry ManifestEntry) error {
+		if _, ok := snapshotTargets[filepath.Clean(entry.Path)]; ok {
+			snapshotEntries[filepath.Clean(entry.Path)] = entry
+		}
 		err := diff.add(entry)
 		if _, remote := errors.AsType[*manifestOrderError](err); err == nil || remote {
 			return err
@@ -557,8 +562,9 @@ func (hs RemoteSync) prepare(
 	defer func() { err = errors.Join(err, delta.Close()) }()
 	prepared.root = mirrorRoot
 	prepared.mirrorImport, err = hs.prepareMirror(ctx, splitTargets{
-		dirScoped:  dirScoped,
-		fileScoped: fileScoped,
+		dirScoped:       dirScoped,
+		fileScoped:      fileScoped,
+		snapshotEntries: snapshotEntries,
 	}, delta, bootstrap, mirrorRoot, prepared)
 	if err != nil {
 		return nil, err
@@ -838,6 +844,10 @@ func (hs RemoteSync) reportLegacyFallback() {
 type splitTargets struct {
 	dirScoped  TargetSet
 	fileScoped TargetSet
+	// snapshotEntries holds the streamed manifest entries of SQLite snapshot
+	// targets (a handful of files), so a changed one can be refreshed with
+	// sqlite3_rsync and stamped with its manifest identity.
+	snapshotEntries map[string]ManifestEntry
 }
 
 func mergeAgentPaths(
@@ -1201,6 +1211,11 @@ func (hs RemoteSync) prepareMirror(
 		if err := RemoveMirrorTypeConflicts(mirrorRoot, fetch); err != nil {
 			return nil, err
 		}
+		// Changed SQLite snapshots go over sqlite3_rsync (changed pages only);
+		// the rest, and any database it could not refresh, use the archive.
+		// The paths are already in the journal, so the import still
+		// processes them.
+		fetch = hs.rsyncSQLiteSnapshots(ctx, fetch, targets.snapshotEntries, mirrorRoot)
 		if len(fetch) > 0 {
 			full := len(fetch) == delta.Total
 			err := hs.downloadIntoMirror(
