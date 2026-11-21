@@ -231,6 +231,14 @@ func (p *piProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+// ComputeMultiFileStatHash lets a fresh engine prove an unchanged transcript
+// from its stat snapshot (size, mtime, ctime, inode). Without it every one-shot
+// sync re-hashes every pi-family transcript to fill the content fingerprint.
+// Pi-family sources have no companions, so the transcript is the only input.
+func (p *piProvider) ComputeMultiFileStatHash(path string) uint64 {
+	return fileStatTupleDigest(0xC5, path)
+}
+
 func (p *piProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -416,6 +424,7 @@ func piProviderCapabilities(agent AgentType) Capabilities {
 		},
 	}
 	caps.Source.StreamingDiscovery = CapabilitySupported
+	caps.Source.MultiFileStatHash = CapabilitySupported
 	if agent == AgentPrimeAgent {
 		caps.Source.ForceReplaceOnParse = CapabilitySupported
 	}
