@@ -156,6 +156,21 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 		AgentCodebuff: {
 			FingerprintHashRequiredForFreshness: true,
 		},
+		AgentPi: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentOMP: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentOMO: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentStepCode: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentPrimeAgent: {
+			FingerprintHashRequiredForFreshness: true,
+		},
 		AgentCopilot: {
 			FingerprintHashRequiredForFreshness: true,
 		},

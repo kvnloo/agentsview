@@ -424,7 +424,10 @@ func piProviderCapabilities(agent AgentType) Capabilities {
 		},
 	}
 	caps.Source.StreamingDiscovery = CapabilitySupported
+	// The stat digest is only stamped after a skip that verified the stored
+	// row hash, so the content hash must gate freshness (as for Codebuff).
 	caps.Source.MultiFileStatHash = CapabilitySupported
+	caps.Sync.FingerprintHashRequiredForFreshness = true
 	if agent == AgentPrimeAgent {
 		caps.Source.ForceReplaceOnParse = CapabilitySupported
 	}
