@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,7 +69,7 @@ func (a *countingPublicationAuthority) ArtifactPublicationPage(
 		nil
 }
 
-func TestAuthoritativePublicationStoreBoundsEmptySegmentTraversal(t *testing.T) {
+func TestAuthoritativePublicationStorePagesPublicationMajor(t *testing.T) {
 	t.Parallel()
 
 	origin := "local-a1b2c3"
@@ -120,28 +121,38 @@ func TestAuthoritativePublicationStoreBoundsEmptySegmentTraversal(t *testing.T) 
 		folderPushCursor{Origin: origin},
 		folderExchangeMaxObjects,
 		folderExchangeMaxBytes,
+		nil,
 	)
 
 	require.NoError(t, err)
-	assert.Empty(t, entries)
+	require.Len(t, entries, folderExchangeMaxObjects)
+	assert.Equal(t, manifestRef, entries[0].Ref,
+		"a publication without segments publishes its manifest first")
 	assert.True(t, more)
-	assert.Equal(t, "session-0511", cursor.PublicationSessionID)
-	assert.Equal(t, 1, authority.pageCalls,
-		"one exchange may inspect only one bounded publication page per kind")
+	assert.Zero(t, cursor.KindIndex)
+	assert.Equal(t, "session-0127", cursor.PublicationSessionID)
+	assert.Equal(t, 1, authority.pageCalls)
 
+	// Once every object is in the target, a pass costs one presence check
+	// per publication and crosses publication pages instead of stopping.
+	checks := 0
 	entries, cursor, more, err = store.folderTransportPage(
 		t.Context(),
-		cursor,
+		folderPushCursor{Origin: origin},
 		folderExchangeMaxObjects,
 		folderExchangeMaxBytes,
+		func(Ref) (bool, error) {
+			checks++
+			return true, nil
+		},
 	)
 	require.NoError(t, err)
-	assert.Len(t, entries, folderExchangeMaxObjects)
-	assert.True(t, more)
-	assert.Equal(t, 1, cursor.KindIndex)
-	assert.Equal(t, "session-0127", cursor.PublicationSessionID)
+	assert.Empty(t, entries)
+	assert.False(t, more)
+	assert.Equal(t, len(publications)+1, checks,
+		"one check per publication manifest plus the checkpoint")
 	assert.Equal(t, 3, authority.pageCalls,
-		"resume reads the remaining segment page and one manifest page")
+		"a skipped pass reads both publication pages once")
 }
 
 func TestAuthoritativePublicationStoreChargesManifestInspection(t *testing.T) {
@@ -193,10 +204,12 @@ func TestAuthoritativePublicationStoreChargesManifestInspection(t *testing.T) {
 		folderPushCursor{Origin: origin},
 		folderExchangeMaxObjects,
 		manifestIdentity.Size,
+		nil,
 	)
 
 	require.NoError(t, err)
-	assert.Empty(t, entries)
+	require.Len(t, entries, 1, "the first manifest may exceed the byte budget")
+	assert.Equal(t, manifestRef, entries[0].Ref)
 	assert.True(t, more)
 	assert.Equal(t, "session-0000", cursor.PublicationSessionID)
 	assert.Equal(t, 1, content.manifestOpens)
@@ -263,15 +276,16 @@ func TestAuthoritativePublicationStorePagesChangedPublications(t *testing.T) {
 		folderPushCursor{Origin: origin},
 		folderExchangeMaxObjects,
 		folderExchangeMaxBytes,
+		nil,
 	)
 
 	require.NoError(t, err)
 	assert.False(t, more)
 	require.Len(t, entries, 1)
 	assert.Equal(t, checkpointRef, entries[0].Ref)
-	assert.Equal(t, 2, authority.pageCalls,
-		"segments and manifests each use one bounded publication traversal")
-	require.Len(t, authority.pageLimits, 2)
+	assert.Equal(t, 1, authority.pageCalls,
+		"segments and manifests share one bounded publication traversal")
+	require.Len(t, authority.pageLimits, 1)
 	assert.LessOrEqual(t, maxInt(authority.pageLimits), transportStorePageSize)
 }
 
@@ -304,7 +318,7 @@ func TestFolderTransportNoOpSkipsAuthoritativePublicationPages(t *testing.T) {
 	first, err := transport.Exchange(t.Context(), firstStore, origin)
 	require.NoError(t, err)
 	assert.Equal(t, 1, first.Published)
-	assert.Equal(t, 2, authority.pageCalls)
+	assert.Equal(t, 1, authority.pageCalls)
 
 	secondStore, err := newAuthoritativePublicationStore(
 		t.Context(), authority, content, origin,
@@ -313,7 +327,7 @@ func TestFolderTransportNoOpSkipsAuthoritativePublicationPages(t *testing.T) {
 	second, err := transport.Exchange(t.Context(), secondStore, origin)
 	require.NoError(t, err)
 	assert.Equal(t, ExchangeResult{}, second)
-	assert.Equal(t, 2, authority.pageCalls,
+	assert.Equal(t, 1, authority.pageCalls,
 		"an unchanged head must not inspect any publication page")
 }
 
@@ -451,4 +465,112 @@ func TestFolderTransportResumesBoundedPublishedRepairAfterReopen(t *testing.T) {
 	),
 		"a durable repair event supersedes the rejection marker",
 	)
+}
+
+// An interrupted exchange can leave an object visible before its journal
+// entry. Skipping present objects must not strand it: the next exchange
+// journals what it finds instead of skipping it.
+func TestFolderTransportJournalsObjectsLeftVisibleByInterruptedExchange(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	origin := "local-a1b2c3"
+	content := newTestArtifactStore(t)
+	segmentBody := []byte("only segment\n")
+	segmentRef := testContentRef(t, origin, KindSegments, segmentBody, ".ndjson")
+	createTestStoreArtifact(t, content, segmentRef, segmentBody)
+	manifestBody, err := canonicalJSON(manifest{
+		Version:  manifestFormatVersion,
+		Origin:   origin,
+		Segments: []string{identityForBytes(t, segmentBody).SHA256},
+	})
+	require.NoError(t, err)
+	manifestIdentity := identityForBytes(t, manifestBody)
+	manifestRef, err := NewRef(
+		origin,
+		KindManifests,
+		manifestIdentity.SHA256+".json",
+	)
+	require.NoError(t, err)
+	createTestStoreArtifact(t, content, manifestRef, manifestBody)
+	checkpointBody := []byte("checkpoint")
+	checkpointIdentity := identityForBytes(t, checkpointBody)
+	checkpointRef, err := NewRef(origin, KindCheckpoints, "cp-0000000001.json")
+	require.NoError(t, err)
+	createTestStoreArtifact(t, content, checkpointRef, checkpointBody)
+	authority := &countingPublicationAuthority{
+		head: db.ArtifactCheckpointHead{
+			Origin:              origin,
+			Sequence:            1,
+			PublicationRevision: 7,
+			SessionMapSHA256:    emptyArtifactPublicationMapSHA256,
+			CheckpointSHA256:    checkpointIdentity.SHA256,
+			CheckpointSize:      checkpointIdentity.Size,
+		},
+		publications: []db.ArtifactPublication{{
+			Origin: origin, SessionID: "one",
+			ManifestHash: manifestIdentity.SHA256,
+		}},
+	}
+	store, err := newAuthoritativePublicationStore(
+		t.Context(), authority, content, origin,
+	)
+	require.NoError(t, err)
+	manifestWire, err := ToWireRef(manifestRef)
+	require.NoError(t, err)
+
+	state := &testFolderTransportStateStore{}
+	target := t.TempDir()
+	opened, err := OpenFolderTransport(target, FolderTransportOptions{
+		StateStore: state,
+	})
+	require.NoError(t, err)
+	interrupted := opened.(*folderTransport)
+	crash := errors.New("interrupted after manifest became visible")
+	interrupted.syncDirectory = func(root *os.Root) error {
+		if _, statErr := root.Lstat(manifestWire.Name); statErr == nil {
+			return crash
+		}
+		return syncFolderDirectory(root)
+	}
+	_, err = interrupted.Exchange(t.Context(), store, origin)
+	require.ErrorIs(t, err, crash)
+	require.NoError(t, interrupted.Close())
+	assert.FileExists(t, filepath.Join(
+		target, origin, string(KindManifests), manifestWire.Name,
+	))
+
+	resumed, err := OpenFolderTransport(target, FolderTransportOptions{
+		StateStore: state,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, resumed.Close()) })
+	result, err := resumed.Exchange(t.Context(), store, origin)
+	require.NoError(t, err)
+	assert.False(t, result.More)
+
+	journaled := map[Ref]bool{}
+	journal, err := os.OpenRoot(filepath.Join(target, folderJournalDirectory))
+	require.NoError(t, err)
+	head, err := readFolderJournalHead(journal)
+	require.NoError(t, err)
+	for sequence := int64(1); sequence <= head.Sequence; sequence++ {
+		event, err := readFolderJournalEvent(journal, sequence)
+		require.NoError(t, err)
+		ref, err := FromWireRef(event.Origin, event.Kind, event.Name)
+		require.NoError(t, err)
+		journaled[ref] = true
+	}
+	require.NoError(t, journal.Close())
+	for _, ref := range []Ref{segmentRef, manifestRef, checkpointRef} {
+		assert.True(t, journaled[ref], "%s is in the target but not journaled", ref.Name)
+	}
+
+	// The recovered generation is published; replaying it is free.
+	before := readTestFolderJournalSequence(t, target)
+	replay, err := resumed.Exchange(t.Context(), store, origin)
+	require.NoError(t, err)
+	assert.Equal(t, ExchangeResult{}, replay)
+	assert.Equal(t, before, readTestFolderJournalSequence(t, target))
 }

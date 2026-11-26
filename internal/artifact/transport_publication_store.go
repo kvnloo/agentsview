@@ -29,6 +29,15 @@ var errArtifactPublicationPageBoundary = errors.New(
 	"artifact publication page boundary",
 )
 
+// folderTransportMaxPublicationPages bounds publication-ledger pages read by
+// one folder exchange. Already-published sessions cost one existence check
+// each, so the bound is generous enough for one pass over a large archive.
+const folderTransportMaxPublicationPages = 64
+
+var errFolderTransportBudgetBoundary = errors.New(
+	"artifact folder transport budget boundary",
+)
+
 // authoritativePublicationStore exposes only the current closure selected by
 // the local publication ledger. The embedded store remains available for pull,
 // but its unproven collection listings never become outbound authority.
@@ -169,24 +178,46 @@ func (s *authoritativePublicationStore) folderTransportGeneration() string {
 	)
 }
 
+// folderTransportPage returns the next bounded page of authoritative objects
+// in publication-major order: each session's segments, then its manifest, and
+// finally the checkpoint. When present is non-nil, objects that already exist
+// in the target are skipped without consuming the budget, and a publication
+// whose manifest already exists is skipped without reading the manifest. A
+// manifest is only published after its segments, so its presence proves the
+// whole publication was published. This keeps a generation change from
+// replaying the closure that is already in the target.
 func (s *authoritativePublicationStore) folderTransportPage(
 	ctx context.Context,
 	cursor folderPushCursor,
 	maxObjects int,
 	maxBytes int64,
+	present folderObjectPresence,
 ) ([]Entry, folderPushCursor, bool, error) {
 	entries := make([]Entry, 0, min(maxObjects, 64))
 	budget := newFolderExchangeBudget(maxObjects, maxBytes)
 	cache := folderTransportPageCache{}
+	pages := 1
 	for !budget.objectLimitReached() {
 		entry, next, done, err := s.nextFolderTransportEntry(
 			ctx,
 			cursor,
 			&cache,
 			budget,
+			present,
 		)
-		if errors.Is(err, errArtifactPublicationPageBoundary) {
+		if errors.Is(err, errFolderTransportBudgetBoundary) {
 			return entries, next, true, nil
+		}
+		if errors.Is(err, errArtifactPublicationPageBoundary) {
+			// A database page ended. Continue with the next page so a pass
+			// over already-published sessions finishes in one exchange
+			// instead of restarting whenever the generation changes.
+			if pages >= folderTransportMaxPublicationPages {
+				return entries, next, true, nil
+			}
+			pages++
+			cursor = next
+			continue
 		}
 		if err != nil {
 			return nil, cursor, false, err
@@ -194,11 +225,21 @@ func (s *authoritativePublicationStore) folderTransportPage(
 		if done {
 			return entries, cursor, false, nil
 		}
+		cursor = next
 		entries = append(entries, entry)
 		budget.consumeObject(entry.Identity.Size)
-		cursor = next
 	}
 	return entries, cursor, true, nil
+}
+
+// folderObjectPresence reports whether an object already exists in the target.
+type folderObjectPresence func(Ref) (bool, error)
+
+func folderObjectPresent(present folderObjectPresence, ref Ref) (bool, error) {
+	if present == nil {
+		return false, nil
+	}
+	return present(ref)
 }
 
 type folderTransportPageCache struct {
@@ -209,6 +250,7 @@ type folderTransportPageCache struct {
 	more             bool
 	pageBoundary     bool
 	manifestSession  string
+	manifest         Entry
 	segments         []string
 }
 
@@ -217,84 +259,11 @@ func (s *authoritativePublicationStore) nextFolderTransportEntry(
 	cursor folderPushCursor,
 	cache *folderTransportPageCache,
 	budget *folderExchangeBudget,
+	present folderObjectPresence,
 ) (Entry, folderPushCursor, bool, error) {
 	for {
 		switch cursor.KindIndex {
 		case 0:
-			allowOversizedObject := budget.objects == 0
-			publication, found, err := s.currentFolderPublication(
-				ctx,
-				cursor,
-				cache,
-			)
-			if err != nil {
-				return Entry{}, cursor, false, err
-			}
-			if !found {
-				cursor.KindIndex = 1
-				cursor.Offset = 0
-				cursor.PublicationSessionID = ""
-				cursor.SegmentIndex = 0
-				continue
-			}
-			if cache.manifestSession != publication.SessionID {
-				manifestEntry, err := statAuthorizedManifest(
-					ctx,
-					s.ArtifactStore,
-					s.origin,
-					publication.ManifestHash,
-				)
-				if err != nil {
-					return Entry{}, cursor, false, err
-				}
-				if !budget.permitsBytes(
-					manifestEntry.Identity.Size,
-					budget.objects == 0 && budget.bytes == 0,
-				) {
-					return Entry{}, cursor, false, errArtifactPublicationPageBoundary
-				}
-				segments, err := readAuthorizedManifestSegments(
-					ctx,
-					s.ArtifactStore,
-					s.origin,
-					manifestEntry,
-				)
-				if err != nil {
-					return Entry{}, cursor, false, err
-				}
-				budget.consumeInspection(manifestEntry.Identity.Size)
-				cache.manifestSession = publication.SessionID
-				cache.segments = segments
-			}
-			if cursor.SegmentIndex >= len(cache.segments) {
-				cursor.PublicationSessionID = publication.SessionID
-				cursor.SegmentIndex = 0
-				cache.advancePublication()
-				continue
-			}
-			ref, err := NewRef(
-				s.origin,
-				KindSegments,
-				cache.segments[cursor.SegmentIndex]+".ndjson",
-			)
-			if err != nil {
-				return Entry{}, cursor, false, err
-			}
-			entry, err := statAuthorizedPublication(
-				ctx,
-				s.ArtifactStore,
-				authorizedPublicationRef{ref: ref},
-			)
-			if err != nil {
-				return Entry{}, cursor, false, err
-			}
-			if !budget.permitsBytes(entry.Identity.Size, allowOversizedObject) {
-				return Entry{}, cursor, false, errArtifactPublicationPageBoundary
-			}
-			next := cursor
-			next.SegmentIndex++
-			return entry, next, false, nil
-		case 1:
 			publication, found, err := s.currentFolderPublication(
 				ctx,
 				cursor,
@@ -307,15 +276,98 @@ func (s *authoritativePublicationStore) nextFolderTransportEntry(
 				cursor.KindIndex = 2
 				cursor.Offset = 0
 				cursor.PublicationSessionID = ""
+				cursor.SegmentIndex = 0
 				continue
+			}
+			if cache.manifestSession != publication.SessionID {
+				manifestRef, err := NewRef(
+					s.origin,
+					KindManifests,
+					publication.ManifestHash+".json",
+				)
+				if err != nil {
+					return Entry{}, cursor, false, err
+				}
+				if cursor.SegmentIndex == 0 {
+					published, err := folderObjectPresent(present, manifestRef)
+					if err != nil {
+						return Entry{}, cursor, false, err
+					}
+					if published {
+						cursor.PublicationSessionID = publication.SessionID
+						cache.advancePublication()
+						continue
+					}
+				}
+				manifestEntry, err := statAuthorizedPublication(
+					ctx,
+					s.ArtifactStore,
+					authorizedPublicationRef{ref: manifestRef},
+				)
+				if err != nil {
+					return Entry{}, cursor, false, err
+				}
+				if !budget.permitsBytes(
+					manifestEntry.Identity.Size,
+					budget.objects == 0 && budget.bytes == 0,
+				) {
+					return Entry{}, cursor, false, errFolderTransportBudgetBoundary
+				}
+				segments, err := readAuthorizedManifestSegments(
+					ctx,
+					s.ArtifactStore,
+					s.origin,
+					manifestEntry,
+				)
+				if err != nil {
+					return Entry{}, cursor, false, err
+				}
+				budget.consumeInspection(manifestEntry.Identity.Size)
+				cache.manifestSession = publication.SessionID
+				cache.manifest = manifestEntry
+				cache.segments = segments
+			}
+			if cursor.SegmentIndex >= len(cache.segments) {
+				// Every segment precedes its manifest, so a published
+				// manifest always names a complete publication.
+				skip, err := folderObjectPresent(present, cache.manifest.Ref)
+				if err != nil {
+					return Entry{}, cursor, false, err
+				}
+				if skip {
+					cursor.PublicationSessionID = publication.SessionID
+					cursor.SegmentIndex = 0
+					cache.advancePublication()
+					continue
+				}
+				if !budget.permitsBytes(
+					cache.manifest.Identity.Size,
+					budget.objects == 0,
+				) {
+					return Entry{}, cursor, false, errFolderTransportBudgetBoundary
+				}
+				entry := cache.manifest
+				next := cursor
+				next.PublicationSessionID = publication.SessionID
+				next.SegmentIndex = 0
+				cache.advancePublication()
+				return entry, next, false, nil
 			}
 			ref, err := NewRef(
 				s.origin,
-				KindManifests,
-				publication.ManifestHash+".json",
+				KindSegments,
+				cache.segments[cursor.SegmentIndex]+".ndjson",
 			)
 			if err != nil {
 				return Entry{}, cursor, false, err
+			}
+			skip, err := folderObjectPresent(present, ref)
+			if err != nil {
+				return Entry{}, cursor, false, err
+			}
+			if skip {
+				cursor.SegmentIndex++
+				continue
 			}
 			entry, err := statAuthorizedPublication(
 				ctx,
@@ -326,11 +378,10 @@ func (s *authoritativePublicationStore) nextFolderTransportEntry(
 				return Entry{}, cursor, false, err
 			}
 			if !budget.permitsBytes(entry.Identity.Size, budget.objects == 0) {
-				return Entry{}, cursor, false, errArtifactPublicationPageBoundary
+				return Entry{}, cursor, false, errFolderTransportBudgetBoundary
 			}
 			next := cursor
-			next.PublicationSessionID = publication.SessionID
-			cache.advancePublication()
+			next.SegmentIndex++
 			return entry, next, false, nil
 		case 2:
 			if cursor.Offset > 0 {
@@ -352,6 +403,14 @@ func (s *authoritativePublicationStore) nextFolderTransportEntry(
 			if err != nil {
 				return Entry{}, cursor, false, err
 			}
+			skip, err := folderObjectPresent(present, ref)
+			if err != nil {
+				return Entry{}, cursor, false, err
+			}
+			if skip {
+				cursor.Offset = 1
+				continue
+			}
 			entry, err := statAuthorizedPublication(
 				ctx,
 				s.ArtifactStore,
@@ -361,7 +420,7 @@ func (s *authoritativePublicationStore) nextFolderTransportEntry(
 				return Entry{}, cursor, false, err
 			}
 			if !budget.permitsBytes(entry.Identity.Size, budget.objects == 0) {
-				return Entry{}, cursor, false, errArtifactPublicationPageBoundary
+				return Entry{}, cursor, false, errFolderTransportBudgetBoundary
 			}
 			next := cursor
 			next.Offset = 1
@@ -413,6 +472,7 @@ func (s *authoritativePublicationStore) currentFolderPublication(
 		cache.publicationIndex = 0
 		cache.more = more
 		cache.manifestSession = ""
+		cache.manifest = Entry{}
 		cache.segments = nil
 	}
 	if cache.publicationIndex >= len(cache.publications) {
@@ -424,6 +484,7 @@ func (s *authoritativePublicationStore) currentFolderPublication(
 func (c *folderTransportPageCache) advancePublication() {
 	c.publicationIndex++
 	c.manifestSession = ""
+	c.manifest = Entry{}
 	c.segments = nil
 	if c.publicationIndex == len(c.publications) && c.more {
 		c.loaded = false

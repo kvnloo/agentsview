@@ -55,10 +55,20 @@ type folderTransport struct {
 	stateLoaded          bool
 	pullSequence         int64
 	publishedGeneration  string
+	// pushInFlight is persisted before an authoritative page publishes
+	// objects and cleared when the page is journaled. Loading it set means
+	// the previous exchange was interrupted, so the next pass recovers.
+	pushInFlight   bool
+	pushRecovering bool
 }
+
+// folderPushLayoutPublicationMajor marks cursors that walk each publication's
+// segments and manifest together. Cursors from older layouts restart.
+const folderPushLayoutPublicationMajor = 1
 
 type folderPushCursor struct {
 	Generation           string `json:"generation,omitempty"`
+	Layout               int    `json:"layout,omitempty"`
 	Origin               string `json:"origin,omitempty"`
 	KindIndex            int    `json:"kind_index,omitempty"`
 	Offset               int    `json:"offset,omitempty"`
@@ -660,6 +670,8 @@ type folderTransportPersistedState struct {
 	PublishedGeneration string           `json:"published_generation,omitempty"`
 	PullSequence        int64            `json:"pull_sequence,omitempty"`
 	Push                folderPushCursor `json:"push"`
+	PushInFlight        bool             `json:"push_in_flight,omitempty"`
+	PushRecovering      bool             `json:"push_recovering,omitempty"`
 }
 
 func (t *folderTransport) loadStateLocked(ctx context.Context) error {
@@ -684,6 +696,8 @@ func (t *folderTransport) loadStateLocked(ctx context.Context) error {
 		t.pushCursor = state.Push
 		t.pullSequence = state.PullSequence
 		t.publishedGeneration = state.PublishedGeneration
+		t.pushRecovering = state.PushRecovering || state.PushInFlight
+		t.pushInFlight = false
 	}
 	t.stateLoaded = true
 	return nil
@@ -713,6 +727,8 @@ func (t *folderTransport) saveStateLocked(ctx context.Context) error {
 		PublishedGeneration: t.publishedGeneration,
 		PullSequence:        t.pullSequence,
 		Push:                t.pushCursor,
+		PushInFlight:        t.pushInFlight,
+		PushRecovering:      t.pushRecovering,
 	})
 	if err != nil {
 		return err
