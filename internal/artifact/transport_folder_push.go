@@ -32,6 +32,7 @@ type folderTransportPublicationPager interface {
 		folderPushCursor,
 		int,
 		int64,
+		folderObjectPresence,
 	) ([]Entry, folderPushCursor, bool, error)
 }
 
@@ -150,10 +151,16 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 	pager folderTransportPublicationPager,
 	origin string,
 ) (published int, more bool, retErr error) {
+	if t.pushInFlight {
+		// An earlier exchange on this transport failed mid-page.
+		t.pushRecovering = true
+		t.pushInFlight = false
+	}
 	generation := pager.folderTransportGeneration()
 	continuing := t.pushCursor.Origin == origin &&
-		t.pushCursor.Generation == generation
-	if generation == t.publishedGeneration {
+		t.pushCursor.Generation == generation &&
+		t.pushCursor.Layout == folderPushLayoutPublicationMajor
+	if generation == t.publishedGeneration && !t.pushRecovering {
 		switch {
 		case continuing && t.pushCursor.Repair:
 		case !t.repairPublished:
@@ -161,30 +168,52 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 		default:
 			t.pushCursor = folderPushCursor{
 				Generation: generation,
+				Layout:     folderPushLayoutPublicationMajor,
 				Origin:     origin,
 				Repair:     true,
 			}
 		}
 	} else if !continuing || t.pushCursor.Repair {
+		// A new generation restarts the pass, but objects already in the
+		// target are skipped below, so the restart costs one existence
+		// check per publication instead of replaying the whole closure.
 		t.pushCursor = folderPushCursor{
 			Generation: generation,
+			Layout:     folderPushLayoutPublicationMajor,
 			Origin:     origin,
 		}
-	}
-	entries, next, more, err := pager.folderTransportPage(
-		ctx,
-		t.pushCursor,
-		t.maxObjects,
-		t.maxBytes,
-	)
-	if err != nil {
-		return 0, false, err
 	}
 	originRoot, err := t.ensureFolderSubrootLocked(t.root, origin, "origin")
 	if err != nil {
 		return 0, false, err
 	}
 	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
+	// Repair verifies every object, and recovery after an interrupted page
+	// must re-journal objects that became visible before their journal
+	// entry, so both walk the full closure.
+	var present folderObjectPresence
+	if !t.pushCursor.Repair && !t.pushRecovering {
+		present = folderOriginPresence(originRoot)
+	}
+	entries, next, more, err := pager.folderTransportPage(
+		ctx,
+		t.pushCursor,
+		t.maxObjects,
+		t.maxBytes,
+		present,
+	)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(entries) > 0 && !t.pushInFlight {
+		// Record that objects may become visible before their journal
+		// entries. If this exchange is interrupted, the next one recovers
+		// by journaling objects it finds instead of skipping them.
+		t.pushInFlight = true
+		if err := t.saveStateLocked(ctx); err != nil {
+			return 0, false, err
+		}
+	}
 	var kindRoot *os.Root
 	var openKind Kind
 	defer func() {
@@ -236,7 +265,9 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 		if created {
 			published++
 		}
-		if !t.pushCursor.Repair || created || rejectionPending {
+		// An object that already existed was journaled when it was created,
+		// unless an interrupted exchange left it visible without its entry.
+		if created || rejectionPending || t.pushRecovering {
 			if err := t.appendFolderJournalLocked(ctx, entry); err != nil {
 				return published, false, err
 			}
@@ -251,11 +282,33 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 		}
 	}
 	t.pushCursor = next
+	t.pushInFlight = false
 	if !more {
 		t.publishedGeneration = generation
+		t.pushRecovering = false
 		t.pushCursor = folderPushCursor{}
 	}
 	return published, more, nil
+}
+
+// folderOriginPresence reports whether a regular object already exists under
+// one origin. Presence is checked by name only; RepairPublished verifies
+// content.
+func folderOriginPresence(originRoot *os.Root) folderObjectPresence {
+	return func(ref Ref) (bool, error) {
+		wire, err := ToWireRef(ref)
+		if err != nil {
+			return false, err
+		}
+		info, err := originRoot.Lstat(string(ref.Kind) + "/" + wire.Name)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return info.Mode().IsRegular(), nil
+	}
 }
 
 func (t *folderTransport) removeAbandonedPublishTempsLocked(
