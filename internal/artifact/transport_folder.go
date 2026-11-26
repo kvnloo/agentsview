@@ -50,6 +50,7 @@ type folderTransport struct {
 	maxObjects           int
 	maxBytes             int64
 	repairPublished      bool
+	pullOnly             bool
 	pushCursor           folderPushCursor
 	stateStore           FolderTransportStateStore
 	stateLoaded          bool
@@ -83,8 +84,10 @@ func OpenFolderTransport(
 	if err := rejectFolderTargetOverlap(canonical, opts.ForbiddenRoots); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(canonical, 0o755); err != nil {
-		return nil, fmt.Errorf("creating artifact folder target: %w", err)
+	if !opts.PullOnly {
+		if err := os.MkdirAll(canonical, 0o755); err != nil {
+			return nil, fmt.Errorf("creating artifact folder target: %w", err)
+		}
 	}
 	root, identity, err := openFolderTargetRoot(canonical)
 	if err != nil {
@@ -102,6 +105,7 @@ func OpenFolderTransport(
 		maxObjects:      opts.MaxObjects,
 		maxBytes:        opts.MaxBytes,
 		repairPublished: opts.RepairPublished,
+		pullOnly:        opts.PullOnly,
 		stateStore:      opts.StateStore,
 	}
 	if transport.maxObjects <= 0 {
@@ -109,6 +113,18 @@ func OpenFolderTransport(
 	}
 	if transport.maxBytes <= 0 {
 		transport.maxBytes = folderExchangeMaxBytes
+	}
+	if transport.pullOnly {
+		// A pull-only reader never initializes or repairs the marker.
+		marker, err := readFolderMarker(root)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"pull-only artifact folder target has no valid marker: %w",
+				err,
+			)
+		}
+		transport.namespaceID = marker.NamespaceID
+		return transport, nil
 	}
 	if err := transport.prepareMarker(); err != nil {
 		return nil, err
@@ -159,6 +175,9 @@ func (t *folderTransport) Exchange(
 	if t.closed || t.root == nil {
 		return ExchangeResult{}, fs.ErrClosed
 	}
+	if t.pullOnly {
+		return t.exchangePullOnlyLocked(ctx, store, publishOrigin)
+	}
 	lock, err := t.acquireExchangeLockLocked(ctx)
 	if err != nil {
 		return ExchangeResult{}, err
@@ -189,6 +208,58 @@ func (t *folderTransport) Exchange(
 		return result, err
 	}
 	return result, nil
+}
+
+// exchangePullOnlyLocked imports journaled peer objects without taking the
+// folder lock or writing to the folder. Only the local continuation state
+// changes. The folder may be replaced by a newer copy between exchanges; a
+// file that changes while it is read fails this exchange and is retried.
+func (t *folderTransport) exchangePullOnlyLocked(
+	ctx context.Context,
+	store ArtifactStore,
+	publishOrigin string,
+) (ExchangeResult, error) {
+	if err := t.prepareLocked(); err != nil {
+		return ExchangeResult{}, err
+	}
+	if err := t.loadStateLocked(ctx); err != nil {
+		return ExchangeResult{}, err
+	}
+	if !t.repairPublished {
+		result, err := t.pullLocked(ctx, store, publishOrigin)
+		if err != nil {
+			return result, err
+		}
+		return result, t.finishPullOnlyPageLocked(ctx)
+	}
+	// A full pull-only exchange replays the whole journal in one call, one
+	// bounded page at a time, so a skipped object that has since arrived in
+	// the copy is imported. Restarting from the first entry on every call
+	// would never finish a journal larger than one page.
+	t.pullSequence = 0
+	var total ExchangeResult
+	for {
+		page, err := t.pullLocked(ctx, store, publishOrigin)
+		total.Received += page.Received
+		total.Quarantined += page.Quarantined
+		total.Skipped += page.Skipped
+		if err != nil {
+			return total, err
+		}
+		if err := t.finishPullOnlyPageLocked(ctx); err != nil {
+			return total, err
+		}
+		if !page.More {
+			return total, nil
+		}
+	}
+}
+
+func (t *folderTransport) finishPullOnlyPageLocked(ctx context.Context) error {
+	if err := t.verifyRootIdentityLocked(); err != nil {
+		return err
+	}
+	return t.saveStateLocked(ctx)
 }
 
 func (t *folderTransport) Close() error {

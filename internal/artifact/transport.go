@@ -23,7 +23,12 @@ type ExchangeResult struct {
 	Received    int
 	Published   int
 	Quarantined int
-	More        bool
+	// Skipped counts journaled objects a pull-only exchange could not import
+	// because they were absent or invalid in the folder. A pull-only reader
+	// cannot leave a rejection marker, so it skips them; an explicit full
+	// pull-only sync replays the journal from the start.
+	Skipped int
+	More    bool
 }
 
 // FolderTransportOptions configures a bounded folder exchange. RepairPublished
@@ -36,6 +41,12 @@ type FolderTransportOptions struct {
 	MaxBytes        int64
 	StateStore      FolderTransportStateStore
 	RepairPublished bool
+	// PullOnly opens an existing marked folder as a read-only source. The
+	// exchange imports journaled peer objects but never publishes, locks,
+	// quarantines, or writes anything in the folder, so the folder can be a
+	// one-way copy of another machine's target. With RepairPublished, the
+	// journal is replayed from the first entry.
+	PullOnly bool
 }
 
 // FolderTransportStateStore persists target-bound continuation state between

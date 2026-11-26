@@ -90,6 +90,9 @@ func validateArtifactSyncConfig(cfg SyncConfig) error {
 	if cfg.Target != "" && cfg.Host != "" {
 		return errors.New("--target cannot be combined with --host")
 	}
+	if cfg.PullOnly && cfg.Target == "" {
+		return errors.New("--pull-only requires --target")
+	}
 	return nil
 }
 
@@ -104,6 +107,7 @@ func runArtifactFolderSync(
 		Target:         cfg.Target,
 		ForbiddenRoots: artifactSyncForbiddenRoots(appCfg),
 		Full:           cfg.Full,
+		PullOnly:       cfg.PullOnly,
 	})
 	if err != nil {
 		return result, &artifactFolderSyncError{cause: err}
@@ -313,6 +317,13 @@ func printArtifactSyncSummary(w io.Writer, result artifact.SyncResult) {
 			w,
 			"; quarantined %s",
 			artifactSyncCount(result.Quarantined, "object"),
+		)
+	}
+	if result.SkippedArtifacts > 0 {
+		fmt.Fprintf(
+			w,
+			"; skipped %s missing or invalid in the folder",
+			artifactSyncCount(result.SkippedArtifacts, "object"),
 		)
 	}
 	fmt.Fprintln(w)

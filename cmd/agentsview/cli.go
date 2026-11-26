@@ -429,6 +429,11 @@ func newSyncCommandWithRunner(run func(context.Context, SyncConfig)) *cobra.Comm
 		"",
 		"Exchange normalized session artifacts with a trusted folder",
 	)
+	cmd.Flags().BoolVar(
+		&cfg.PullOnly, "pull-only", false,
+		"With --target, import from the folder without publishing or writing to it\n"+
+			"(for a read-only replica of a copied folder; runs without the daemon)",
+	)
 	cmd.Flags().StringVar(
 		&cfg.CPUProfile, "cpuprofile", "",
 		"Write CPU profile to file (developer use)",

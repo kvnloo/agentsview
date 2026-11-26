@@ -18,19 +18,25 @@ type SyncOptions struct {
 	Origin         string
 	ForbiddenRoots []string
 	Full           bool
+	// PullOnly imports from an existing folder without publishing or
+	// writing to it. See FolderTransportOptions.PullOnly.
+	PullOnly bool
 }
 
 // SyncResult summarizes one bounded export, exchange, and import pass.
 type SyncResult struct {
-	Origin             string `json:"origin"`
-	ExportedSessions   int    `json:"exported_sessions"`
-	RejectedSessions   int    `json:"rejected_sessions"`
-	ImportedSessions   int    `json:"imported_sessions"`
-	ImportedMessages   int    `json:"imported_messages"`
-	Quarantined        int    `json:"quarantined"`
-	ReceivedArtifacts  int    `json:"received_artifacts"`
-	PublishedArtifacts int    `json:"published_artifacts"`
-	More               bool   `json:"more"`
+	Origin           string `json:"origin"`
+	ExportedSessions int    `json:"exported_sessions"`
+	RejectedSessions int    `json:"rejected_sessions"`
+	ImportedSessions int    `json:"imported_sessions"`
+	ImportedMessages int    `json:"imported_messages"`
+	Quarantined      int    `json:"quarantined"`
+	// SkippedArtifacts is set only by direct pull-only syncs, which the
+	// daemon exchange endpoint never runs, so it stays out of the API.
+	SkippedArtifacts   int  `json:"-"`
+	ReceivedArtifacts  int  `json:"received_artifacts"`
+	PublishedArtifacts int  `json:"published_artifacts"`
+	More               bool `json:"more"`
 }
 
 // Sync opens the local artifact repository on demand and performs one bounded
@@ -105,6 +111,7 @@ func SyncWithRepository(
 			ForbiddenRoots:  forbidden,
 			StateStore:      databaseFolderTransportState{database: database},
 			RepairPublished: opts.Full,
+			PullOnly:        opts.PullOnly,
 		},
 	)
 	if err != nil {
@@ -156,6 +163,7 @@ func SyncWithRepository(
 	result.ReceivedArtifacts = exchanged.Received
 	result.PublishedArtifacts = exchanged.Published
 	result.Quarantined += exchanged.Quarantined
+	result.SkippedArtifacts = exchanged.Skipped
 
 	importMore, err := drainArtifactSyncImports(
 		ctx,

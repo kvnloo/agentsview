@@ -32,6 +32,8 @@ type SyncConfig struct {
 	Full   bool
 	Host   string
 	Target string
+	// PullOnly imports from Target without publishing or writing to it.
+	PullOnly bool
 	// CPUProfile, MemProfile, and Trace are hidden flags that capture a
 	// pprof CPU profile, allocation snapshot, and runtime trace for the
 	// sync pass. Empty strings disable each independently.
@@ -94,6 +96,11 @@ func doSync(ctx context.Context, cfg SyncConfig) (hadRemoteFailures bool) {
 	defer stopProfile()
 
 	applyClassifierConfig(appCfg)
+	if cfg.PullOnly {
+		// The daemon's exchange endpoint always publishes. A pull-only
+		// replica runs directly and must not start a daemon.
+		appCfg.NoDaemonAutostart = true
+	}
 
 	if includeLocal || len(remoteHosts) > 0 {
 		operation := "sync"
@@ -113,6 +120,12 @@ func doSync(ctx context.Context, cfg SyncConfig) (hadRemoteFailures bool) {
 		}
 		if tr.Mode == transportHTTP {
 			useDaemon := useDaemonForSync(tr)
+			if useDaemon && cfg.PullOnly {
+				fatal(
+					"--pull-only runs without the daemon; stop it with " +
+						"`agentsview daemon stop`, then retry",
+				)
+			}
 			if useDaemon {
 				fmt.Printf("Server: %s\n", tr.URL)
 				fmt.Println("  Remains running after sync; stop with `agentsview daemon stop`.")

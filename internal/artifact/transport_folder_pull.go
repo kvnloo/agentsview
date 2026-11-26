@@ -104,7 +104,7 @@ func (t *folderTransport) pullJournalEventLocked(
 		return err
 	}
 	if originRoot == nil {
-		return t.rejectAbsentJournalObjectLocked(event, expected)
+		return t.handleAbsentJournalObjectLocked(event, expected, result)
 	}
 	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
 	kindRoot, err := openOptionalFolderSubroot(originRoot, string(event.Kind), "kind")
@@ -112,12 +112,12 @@ func (t *folderTransport) pullJournalEventLocked(
 		return err
 	}
 	if kindRoot == nil {
-		return t.rejectAbsentJournalObjectLocked(event, expected)
+		return t.handleAbsentJournalObjectLocked(event, expected, result)
 	}
 	defer func() { retErr = errors.Join(retErr, kindRoot.Close()) }()
 	info, err := kindRoot.Lstat(event.Name)
 	if errors.Is(err, fs.ErrNotExist) {
-		return t.rejectAbsentJournalObjectLocked(event, expected)
+		return t.handleAbsentJournalObjectLocked(event, expected, result)
 	}
 	if err != nil {
 		return err
@@ -132,10 +132,32 @@ func (t *folderTransport) pullJournalEventLocked(
 		&expected,
 		result,
 	)
+	countFolderPullOutcome(outcome, result)
+	return err
+}
+
+func countFolderPullOutcome(outcome folderPullOutcome, result *ExchangeResult) {
 	if outcome.Quarantined {
 		result.Quarantined++
 	}
-	return err
+	if outcome.Skipped {
+		result.Skipped++
+	}
+}
+
+// handleAbsentJournalObjectLocked advances past a journal entry whose object
+// is missing. A pull-only reader cannot leave a rejection marker, so it only
+// counts the entry as skipped.
+func (t *folderTransport) handleAbsentJournalObjectLocked(
+	event folderJournalEvent,
+	expected Identity,
+	result *ExchangeResult,
+) error {
+	if t.pullOnly {
+		result.Skipped++
+		return nil
+	}
+	return t.rejectAbsentJournalObjectLocked(event, expected)
 }
 
 // rejectAbsentJournalObjectLocked handles a journal entry whose object is not
@@ -267,9 +289,7 @@ func (t *folderTransport) pullOriginLocked(
 					nil,
 					result,
 				)
-				if outcome.Quarantined {
-					result.Quarantined++
-				}
+				countFolderPullOutcome(outcome, result)
 				return err
 			},
 		)
@@ -283,6 +303,7 @@ func (t *folderTransport) pullOriginLocked(
 
 type folderPullOutcome struct {
 	Quarantined bool
+	Skipped     bool
 }
 
 func (t *folderTransport) pullWireEntryLocked(
@@ -296,6 +317,9 @@ func (t *folderTransport) pullWireEntryLocked(
 	result *ExchangeResult,
 ) (_ folderPullOutcome, retErr error) {
 	if strings.HasPrefix(entry.Name(), folderPublishTempPrefix) {
+		if t.pullOnly {
+			return folderPullOutcome{}, nil
+		}
 		return folderPullOutcome{}, removeFolderFile(kindRoot, entry.Name())
 	}
 	if strings.HasPrefix(entry.Name(), folderMarkerTempPrefix) {
@@ -359,6 +383,9 @@ func (t *folderTransport) pullWireEntryLocked(
 		}
 		if errors.Is(decodeErr, ErrArtifactCorrupt) ||
 			errors.Is(decodeErr, ErrArtifactInvalid) {
+			if t.pullOnly {
+				return folderPullOutcome{Skipped: true}, nil
+			}
 			err := t.rejectFolderEntryLocked(
 				kindRoot,
 				origin,
@@ -374,6 +401,9 @@ func (t *folderTransport) pullWireEntryLocked(
 	}()
 	if err := validateRefIdentity(ref, identity); err != nil {
 		if errors.Is(err, ErrArtifactInvalid) {
+			if t.pullOnly {
+				return folderPullOutcome{Skipped: true}, nil
+			}
 			quarantineErr := t.rejectFolderEntryLocked(
 				kindRoot,
 				origin,
@@ -475,6 +505,11 @@ func (t *folderTransport) QuarantineTransportArtifact(
 	defer t.mu.Unlock()
 	if t.closed || t.root == nil {
 		return fs.ErrClosed
+	}
+	if t.pullOnly {
+		// The local store still quarantines its copy; the folder is
+		// read-only for this reader.
+		return nil
 	}
 	lock, err := t.acquireExchangeLockLocked(ctx)
 	if err != nil {

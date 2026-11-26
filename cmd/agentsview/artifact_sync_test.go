@@ -39,6 +39,63 @@ func TestNewSyncCommandHandsTargetToRunner(t *testing.T) {
 	assert.True(t, got.Full)
 }
 
+func TestNewSyncCommandHandsPullOnlyToRunner(t *testing.T) {
+	var got SyncConfig
+	cmd := newSyncCommandWithRunner(func(_ context.Context, cfg SyncConfig) {
+		got = cfg
+	})
+	cmd.SetArgs([]string{"--target", "replica", "--pull-only"})
+
+	require.NoError(t, cmd.Execute())
+	assert.Equal(t, "replica", got.Target)
+	assert.True(t, got.PullOnly)
+}
+
+func TestNewSyncCommandRejectsPullOnlyWithoutTarget(t *testing.T) {
+	called := false
+	cmd := newSyncCommandWithRunner(func(context.Context, SyncConfig) {
+		called = true
+	})
+	cmd.SetArgs([]string{"--pull-only"})
+
+	err := cmd.Execute()
+	require.EqualError(t, err, "--pull-only requires --target")
+	assert.False(t, called)
+}
+
+func TestRunArtifactFolderSyncPassesPullOnly(t *testing.T) {
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "sessions.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	original := runArtifactSyncCLI
+	var got artifact.SyncOptions
+	runArtifactSyncCLI = func(
+		_ context.Context,
+		_ *db.DB,
+		opts artifact.SyncOptions,
+	) (artifact.SyncResult, error) {
+		got = opts
+		return artifact.SyncResult{}, nil
+	}
+	t.Cleanup(func() { runArtifactSyncCLI = original })
+
+	_, err = runArtifactFolderSync(
+		t.Context(),
+		config.Config{DataDir: t.TempDir()},
+		database,
+		SyncConfig{Target: "replica", PullOnly: true},
+	)
+	require.NoError(t, err)
+	assert.True(t, got.PullOnly)
+}
+
+func TestPrintArtifactSyncSummaryReportsSkippedObjects(t *testing.T) {
+	var out bytes.Buffer
+	printArtifactSyncSummary(&out, artifact.SyncResult{SkippedArtifacts: 2})
+	assert.Contains(t, out.String(),
+		"; skipped 2 objects missing or invalid in the folder")
+}
+
 func TestNewSyncCommandRejectsTargetWithAdHocHost(t *testing.T) {
 	called := false
 	cmd := newSyncCommandWithRunner(func(context.Context, SyncConfig) {
