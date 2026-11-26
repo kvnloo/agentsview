@@ -74,6 +74,33 @@ When a writable local daemon owns SQLite, the CLI asks that daemon to perform
 the exchange after normal session sync. Otherwise, direct mode performs the same
 operation while holding the local write-owner lock.
 
+## Read-only replica of a copied folder
+
+When machines share no folder, one machine can stay the only writer and the
+others can follow a one-way copy of its folder, for example made with
+`rsync`. On a replica, add `--pull-only`:
+
+```bash
+agentsview source sync --target /path/to/copied-folder --pull-only
+```
+
+A pull-only sync imports the other machines' sessions from the folder and
+never publishes, locks, or writes anything in it, so the next copy can replace
+the folder's contents freely. The folder must already exist and carry its
+marker. A pull-only sync runs without the daemon: stop a running daemon first.
+
+Copy the journal so that every entry the replica sees names an object that is
+already in the copy: take a snapshot of `.agentsview-journal` first
+(`head.json` before the event files), then copy the objects, then install the
+snapshot (event files before `head.json`). Always copy `head.json` even when
+its size and time look unchanged, for example with `rsync -I`, because the
+writer often replaces it with a file of the same size. Do not copy
+`.agentsview-artifacts.lock` or temporary files.
+
+If an object is still missing from the copy, the replica skips it and says so
+in the summary. Once a later copy contains the object, run the sync once with
+`--full --pull-only`, which replays the whole journal.
+
 ## What the folder contains
 
 The folder contains normalized, versioned AgentsView artifacts. It does not
