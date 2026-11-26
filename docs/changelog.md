@@ -15,6 +15,16 @@ The latest release is
   across overlapping archives while retaining events unique to each archive.
   Integrations must reconcile event keys and poll times across reports.
 
+- `agentsview source sync --target` now converges when you run it repeatedly
+  while sessions keep changing. Every run that exported a changed session used
+  to publish and journal the origin's whole published history again, 128
+  objects per run, so with more than a few dozen sessions it kept printing
+  `Artifact work remains` and never published the new checkpoint. A run now
+  publishes only the sessions that changed. A journal entry whose object is
+  missing from the folder no longer fails every later run with
+  `artifact folder sync failed`: the reader skips it, and the origin restores
+  and journals the object again on its next run.
+
 - `agentsview source import --type gemini-apps` now imports real Google
   Takeout exports. It used to reject every export with `input does not contain
   a Gemini Apps My Activity HTML document`, because it expected a layout that

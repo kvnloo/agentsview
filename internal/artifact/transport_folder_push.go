@@ -151,48 +151,55 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 	pager folderTransportPublicationPager,
 	origin string,
 ) (published int, more bool, retErr error) {
-	if t.pushInFlight {
-		// An earlier exchange on this transport failed mid-page.
-		t.pushRecovering = true
-		t.pushInFlight = false
+	originRoot, err := t.ensureFolderSubrootLocked(t.root, origin, "origin")
+	if err != nil {
+		return 0, false, err
 	}
-	generation := pager.folderTransportGeneration()
+	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
+	// Finish an interrupted page and restore objects that readers rejected
+	// before deciding whether this generation has anything left to publish.
+	recovered, err := t.recoverFolderPublishIntentLocked(
+		ctx,
+		store,
+		originRoot,
+		origin,
+	)
+	if err != nil {
+		return 0, false, err
+	}
+	repaired, err := t.republishRejectedObjectsLocked(ctx, store, originRoot, origin)
+	if err != nil {
+		return recovered, false, err
+	}
+	published = recovered + repaired
+
+	generation := folderPushGeneration(pager.folderTransportGeneration())
 	continuing := t.pushCursor.Origin == origin &&
-		t.pushCursor.Generation == generation &&
-		t.pushCursor.Layout == folderPushLayoutPublicationMajor
-	if generation == t.publishedGeneration && !t.pushRecovering {
+		t.pushCursor.Generation == generation
+	if generation == t.publishedGeneration {
 		switch {
 		case continuing && t.pushCursor.Repair:
 		case !t.repairPublished:
-			return 0, false, nil
+			return published, false, nil
 		default:
 			t.pushCursor = folderPushCursor{
 				Generation: generation,
-				Layout:     folderPushLayoutPublicationMajor,
 				Origin:     origin,
 				Repair:     true,
 			}
 		}
 	} else if !continuing || t.pushCursor.Repair {
 		// A new generation restarts the pass, but objects already in the
-		// target are skipped below, so the restart costs one existence
-		// check per publication instead of replaying the whole closure.
+		// target are skipped, so the restart costs one existence check per
+		// publication instead of replaying the whole closure.
 		t.pushCursor = folderPushCursor{
 			Generation: generation,
-			Layout:     folderPushLayoutPublicationMajor,
 			Origin:     origin,
 		}
 	}
-	originRoot, err := t.ensureFolderSubrootLocked(t.root, origin, "origin")
-	if err != nil {
-		return 0, false, err
-	}
-	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
-	// Repair verifies every object, and recovery after an interrupted page
-	// must re-journal objects that became visible before their journal
-	// entry, so both walk the full closure.
+	// Repair verifies every object, so it walks the full closure.
 	var present folderObjectPresence
-	if !t.pushCursor.Repair && !t.pushRecovering {
+	if !t.pushCursor.Repair {
 		present = folderOriginPresence(originRoot)
 	}
 	entries, next, more, err := pager.folderTransportPage(
@@ -203,15 +210,13 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 		present,
 	)
 	if err != nil {
-		return 0, false, err
+		return published, false, err
 	}
-	if len(entries) > 0 && !t.pushInFlight {
-		// Record that objects may become visible before their journal
-		// entries. If this exchange is interrupted, the next one recovers
-		// by journaling objects it finds instead of skipping them.
-		t.pushInFlight = true
-		if err := t.saveStateLocked(ctx); err != nil {
-			return 0, false, err
+	if len(entries) > 0 {
+		// Objects become visible before their journal entries. Record the
+		// page first so an interrupted exchange can journal what it left.
+		if err := t.writeFolderPublishIntentLocked(originRoot, entries); err != nil {
+			return published, false, err
 		}
 	}
 	var kindRoot *os.Root
@@ -265,9 +270,9 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 		if created {
 			published++
 		}
-		// An object that already existed was journaled when it was created,
-		// unless an interrupted exchange left it visible without its entry.
-		if created || rejectionPending || t.pushRecovering {
+		// An object that already existed was journaled when it was created;
+		// the publish intent covers objects an interrupted page left behind.
+		if created || rejectionPending {
 			if err := t.appendFolderJournalLocked(ctx, entry); err != nil {
 				return published, false, err
 			}
@@ -281,14 +286,26 @@ func (t *folderTransport) pushAuthoritativeOriginLocked(
 			}
 		}
 	}
+	if len(entries) > 0 {
+		if err := t.clearFolderPublishIntentLocked(originRoot); err != nil {
+			return published, false, err
+		}
+	}
 	t.pushCursor = next
-	t.pushInFlight = false
 	if !more {
 		t.publishedGeneration = generation
-		t.pushRecovering = false
 		t.pushCursor = folderPushCursor{}
 	}
 	return published, more, nil
+}
+
+// folderPushGenerationLayout tags generations walked in publication-major
+// order, so a continuation cursor written by an older layout restarts instead
+// of resuming at an offset that meant something else.
+const folderPushGenerationLayout = "pm1:"
+
+func folderPushGeneration(generation string) string {
+	return folderPushGenerationLayout + generation
 }
 
 // folderOriginPresence reports whether a regular object already exists under

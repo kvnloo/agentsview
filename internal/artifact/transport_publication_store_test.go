@@ -97,14 +97,19 @@ func TestAuthoritativePublicationStorePagesPublicationMajor(t *testing.T) {
 			ManifestHash: manifestIdentity.SHA256,
 		}
 	}
+	checkpointBody := []byte("checkpoint")
+	checkpointIdentity := identityForBytes(t, checkpointBody)
+	checkpointRef, err := NewRef(origin, KindCheckpoints, "cp-0000000001.json")
+	require.NoError(t, err)
+	createTestStoreArtifact(t, content, checkpointRef, checkpointBody)
 	authority := &countingPublicationAuthority{
 		head: db.ArtifactCheckpointHead{
 			Origin:              origin,
 			Sequence:            1,
 			PublicationRevision: 7,
 			SessionMapSHA256:    emptyArtifactPublicationMapSHA256,
-			CheckpointSHA256:    strings64("a"),
-			CheckpointSize:      10,
+			CheckpointSHA256:    checkpointIdentity.SHA256,
+			CheckpointSize:      checkpointIdentity.Size,
 		},
 		publications: publications,
 	}
@@ -147,10 +152,11 @@ func TestAuthoritativePublicationStorePagesPublicationMajor(t *testing.T) {
 		},
 	)
 	require.NoError(t, err)
-	assert.Empty(t, entries)
+	require.Len(t, entries, 1, "the checkpoint is always verified")
+	assert.Equal(t, checkpointRef, entries[0].Ref)
 	assert.False(t, more)
-	assert.Equal(t, len(publications)+1, checks,
-		"one check per publication manifest plus the checkpoint")
+	assert.Equal(t, len(publications), checks,
+		"one existence check per publication manifest")
 	assert.Equal(t, 3, authority.pageCalls,
 		"a skipped pass reads both publication pages once")
 }
@@ -468,8 +474,8 @@ func TestFolderTransportResumesBoundedPublishedRepairAfterReopen(t *testing.T) {
 }
 
 // An interrupted exchange can leave an object visible before its journal
-// entry. Skipping present objects must not strand it: the next exchange
-// journals what it finds instead of skipping it.
+// entry. Skipping present objects must not strand it: the publish intent
+// written before the page lets the next exchange journal what it left.
 func TestFolderTransportJournalsObjectsLeftVisibleByInterruptedExchange(
 	t *testing.T,
 ) {
@@ -566,6 +572,7 @@ func TestFolderTransportJournalsObjectsLeftVisibleByInterruptedExchange(
 	for _, ref := range []Ref{segmentRef, manifestRef, checkpointRef} {
 		assert.True(t, journaled[ref], "%s is in the target but not journaled", ref.Name)
 	}
+	assert.NoFileExists(t, filepath.Join(target, origin, folderPublishIntentName))
 
 	// The recovered generation is published; replaying it is free.
 	before := readTestFolderJournalSequence(t, target)
