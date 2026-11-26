@@ -95,40 +95,30 @@ func (t *folderTransport) pullJournalEventLocked(
 	event folderJournalEvent,
 	result *ExchangeResult,
 ) (retErr error) {
-	originRoot, err := openFolderSubroot(t.root, event.Origin, "origin")
+	expected, err := NewIdentity(event.SHA256, event.Size)
 	if err != nil {
 		return err
 	}
-	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
-	kindRoot, err := openFolderSubroot(originRoot, string(event.Kind), "kind")
+	originRoot, err := openOptionalFolderSubroot(t.root, event.Origin, "origin")
 	if err != nil {
 		return err
+	}
+	if originRoot == nil {
+		return t.rejectAbsentJournalObjectLocked(event, expected, result)
+	}
+	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
+	kindRoot, err := openOptionalFolderSubroot(originRoot, string(event.Kind), "kind")
+	if err != nil {
+		return err
+	}
+	if kindRoot == nil {
+		return t.rejectAbsentJournalObjectLocked(event, expected, result)
 	}
 	defer func() { retErr = errors.Join(retErr, kindRoot.Close()) }()
 	info, err := kindRoot.Lstat(event.Name)
 	if errors.Is(err, fs.ErrNotExist) {
-		expected, identityErr := NewIdentity(event.SHA256, event.Size)
-		if identityErr != nil {
-			return identityErr
-		}
-		validationErr := validateFolderJournalRejection(
-			kindRoot,
-			event.Name,
-			expected,
-		)
-		if errors.Is(validationErr, ErrArtifactInvalid) {
-			return t.writeFolderJournalRejectionLocked(
-				kindRoot,
-				event.Name,
-				expected,
-			)
-		}
-		return validationErr
+		return t.rejectAbsentJournalObjectLocked(event, expected, result)
 	}
-	if err != nil {
-		return err
-	}
-	expected, err := NewIdentity(event.SHA256, event.Size)
 	if err != nil {
 		return err
 	}
@@ -146,6 +136,61 @@ func (t *folderTransport) pullJournalEventLocked(
 		result.Quarantined++
 	}
 	return err
+}
+
+// rejectAbsentJournalObjectLocked handles a journal entry whose object is not
+// in the target, for example after an interrupted publication, a peer
+// quarantine, or a partial copy of the folder. The reader leaves a rejection
+// marker so the origin's repair pass re-journals the object, and advances past
+// the entry instead of failing every later exchange.
+func (t *folderTransport) rejectAbsentJournalObjectLocked(
+	event folderJournalEvent,
+	expected Identity,
+	result *ExchangeResult,
+) (retErr error) {
+	originRoot, err := t.ensureFolderSubrootLocked(t.root, event.Origin, "origin")
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
+	kindRoot, err := t.ensureFolderSubrootLocked(
+		originRoot,
+		string(event.Kind),
+		"kind",
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, kindRoot.Close()) }()
+	// The object may have been restored since the existence check.
+	if _, err := kindRoot.Lstat(event.Name); err == nil {
+		return fmt.Errorf(
+			"%w: artifact journal object appeared during rejection",
+			ErrArtifactConflict,
+		)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	validationErr := validateFolderJournalRejection(
+		kindRoot,
+		event.Name,
+		expected,
+	)
+	switch {
+	case validationErr == nil:
+		// A reader already quarantined this object and recorded why.
+		return nil
+	case errors.Is(validationErr, fs.ErrNotExist):
+		result.Missing++
+	case errors.Is(validationErr, ErrArtifactInvalid):
+	default:
+		return validationErr
+	}
+	return t.writeFolderJournalRejectionLocked(
+		kindRoot,
+		event.Name,
+		expected,
+	)
 }
 
 func (t *folderTransport) pullRootEntryLocked(

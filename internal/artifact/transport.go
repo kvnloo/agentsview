@@ -23,7 +23,10 @@ type ExchangeResult struct {
 	Received    int
 	Published   int
 	Quarantined int
-	More        bool
+	// Missing counts journal entries skipped because their object was absent
+	// from the target. Each one leaves a rejection marker for repair.
+	Missing int
+	More    bool
 }
 
 // FolderTransportOptions configures a bounded folder exchange. RepairPublished
