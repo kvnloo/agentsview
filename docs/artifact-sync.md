@@ -52,7 +52,9 @@ imports supported peer checkpoints into its local SQLite archive. Publication
 also appends an immutable change-journal entry. Each machine keeps a
 target-bound journal cursor, so repeating the command processes new entries
 instead of rescanning and rehashing the folder's full history. Changed sessions
-publish a new revision.
+publish a new revision. Objects already in the folder are not published or
+journaled again, so a repeated run costs about one file existence check per
+unchanged session.
 
 The command enforces object-count and decoded-byte budgets for both inbound and
 outbound transport work. Because continuation cursors are durable, later runs
@@ -114,7 +116,10 @@ database from backup, keep only one active writer for that restored origin.
   local cursor only after it reads, verifies, and accepts the referenced object,
   so interruption and retry are safe.
 - AgentsView quarantines invalid complete objects so one corrupt peer artifact
-  does not permanently block unrelated origins.
+  does not permanently block unrelated origins. A journal entry whose object is
+  missing from the folder, for example after a partial copy, is handled the
+  same way. In both cases the reader leaves a rejection marker and moves on,
+  and the origin restores the object and journals it again on its next sync.
 - Cooperating AgentsView processes serialize folder operations. Do not edit the
   folder contents manually while an exchange is running.
 - Keep the target outside the AgentsView data directory and every configured
