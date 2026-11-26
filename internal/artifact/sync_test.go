@@ -126,7 +126,7 @@ func TestArtifactSyncTwoNodeFolderRoundTripAndReplay(t *testing.T) {
 	assert.Equal(t, "updated response", updatedMessages[1].Content)
 }
 
-func TestArtifactSyncFullRepairRejournalsMissingObjectForAdvancedPeer(
+func TestArtifactSyncRepublishesRejectedObjectForAdvancedPeer(
 	t *testing.T,
 ) {
 	t.Parallel()
@@ -170,17 +170,20 @@ func TestArtifactSyncFullRepairRejournalsMissingObjectForAdvancedPeer(
 	assert.NoFileExists(t, segmentPath)
 	journalSequence := readTestFolderJournalSequence(t, target)
 
-	noOp, err := SyncWithRepository(t.Context(), databaseA, repositoryA, opts)
-	require.NoError(t, err)
-	assert.Zero(t, noOp.PublishedArtifacts)
-	assert.NoFileExists(t, segmentPath)
-
-	opts.Full = true
+	// The reader's rejection reaches the origin, whose next ordinary sync
+	// restores and re-journals the object without a full repair.
 	repaired, err := SyncWithRepository(t.Context(), databaseA, repositoryA, opts)
 	require.NoError(t, err)
 	assert.Equal(t, 1, repaired.PublishedArtifacts)
 	assert.FileExists(t, segmentPath)
 	assert.Equal(t, journalSequence+1, readTestFolderJournalSequence(t, target))
+
+	opts.Full = true
+	full, err := SyncWithRepository(t.Context(), databaseA, repositoryA, opts)
+	require.NoError(t, err)
+	assert.Zero(t, full.PublishedArtifacts)
+	assert.Equal(t, journalSequence+1, readTestFolderJournalSequence(t, target),
+		"a full repair finds nothing left to restore")
 
 	imported, err := SyncWithRepository(
 		t.Context(),

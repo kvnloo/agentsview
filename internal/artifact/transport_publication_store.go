@@ -180,9 +180,10 @@ func (s *authoritativePublicationStore) folderTransportGeneration() string {
 
 // folderTransportPage returns the next bounded page of authoritative objects
 // in publication-major order: each session's segments, then its manifest, and
-// finally the checkpoint. When present is non-nil, objects that already exist
-// in the target are skipped without consuming the budget, and a publication
-// whose manifest already exists is skipped without reading the manifest. A
+// finally the checkpoint. When present is non-nil, segments and manifests that
+// already exist in the target are skipped without consuming the budget, and a
+// publication whose manifest already exists is skipped without reading the
+// manifest. A
 // manifest is only published after its segments, so its presence proves the
 // whole publication was published. This keeps a generation change from
 // replaying the closure that is already in the target.
@@ -403,14 +404,8 @@ func (s *authoritativePublicationStore) nextFolderTransportEntry(
 			if err != nil {
 				return Entry{}, cursor, false, err
 			}
-			skip, err := folderObjectPresent(present, ref)
-			if err != nil {
-				return Entry{}, cursor, false, err
-			}
-			if skip {
-				cursor.Offset = 1
-				continue
-			}
+			// The checkpoint is never skipped by name: its name is a sequence
+			// number, so publishing it verifies the content in the target.
 			entry, err := statAuthorizedPublication(
 				ctx,
 				s.ArtifactStore,

@@ -1,6 +1,7 @@
 package artifact
 
 import (
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -151,7 +152,7 @@ func TestArtifactSyncConvergesWhileGenerationChangesEveryExchange(
 
 // A journal entry whose object is absent from the folder (for example after a
 // partial copy of the exchange folder) must not fail every later exchange. The
-// reader records a rejection so the publisher's repair pass re-journals it.
+// reader records a rejection, and the origin restores and re-journals it.
 func TestArtifactSyncPullSkipsAbsentJournaledObject(t *testing.T) {
 	t.Parallel()
 
@@ -192,11 +193,13 @@ func TestArtifactSyncPullSkipsAbsentJournaledObject(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, again.ImportedSessions)
 
-	optsA.Full = true
+	// The origin's next ordinary sync sees the rejection and restores the
+	// object; no full repair is needed.
 	repaired, err := SyncWithRepository(t.Context(), databaseA, repositoryA, optsA)
 	require.NoError(t, err)
 	assert.Equal(t, 1, repaired.PublishedArtifacts)
 	assert.FileExists(t, segmentPaths[0])
+	assert.NoFileExists(t, segmentPaths[0]+".rejected")
 
 	healed, err := SyncWithRepository(t.Context(), databaseB, repositoryB, optsB)
 	require.NoError(t, err)
@@ -206,4 +209,56 @@ func TestArtifactSyncPullSkipsAbsentJournaledObject(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, session, "peer is missing %s", id)
 	}
+}
+
+// Downgrading must keep working: the continuation state a converged exchange
+// saves is still readable by the previous release's strict decoder.
+func TestArtifactSyncStateStaysReadableByPreviousRelease(t *testing.T) {
+	t.Parallel()
+
+	target := t.TempDir()
+	database := testDB(t)
+	repository, err := OpenRepository(t.Context(), t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, repository.Close()) })
+	seedSession(t, database, "one", "alpha")
+	_, err = SyncWithRepository(
+		t.Context(),
+		database,
+		repository,
+		SyncOptions{Target: target, Origin: "studio-a1b2c3"},
+	)
+	require.NoError(t, err)
+
+	root, err := os.OpenRoot(target)
+	require.NoError(t, err)
+	marker, err := readFolderMarker(root)
+	require.NoError(t, err)
+	require.NoError(t, root.Close())
+	body, err := database.GetSyncState(
+		t.Context(),
+		"artifact_transport_"+marker.NamespaceID,
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, body)
+
+	// The persisted shape of the previous release.
+	type previousCursor struct {
+		Generation           string `json:"generation,omitempty"`
+		Origin               string `json:"origin,omitempty"`
+		KindIndex            int    `json:"kind_index,omitempty"`
+		Offset               int    `json:"offset,omitempty"`
+		SegmentIndex         int    `json:"segment_index,omitempty"`
+		PublicationSessionID string `json:"publication_session_id,omitempty"`
+		Repair               bool   `json:"repair,omitempty"`
+	}
+	type previousState struct {
+		PublishedGeneration string         `json:"published_generation,omitempty"`
+		PullSequence        int64          `json:"pull_sequence,omitempty"`
+		Push                previousCursor `json:"push"`
+	}
+	var state previousState
+	require.NoError(t, json.Unmarshal(
+		[]byte(body), &state, json.RejectUnknownMembers(true),
+	), "state %s", body)
 }

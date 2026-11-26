@@ -104,7 +104,7 @@ func (t *folderTransport) pullJournalEventLocked(
 		return err
 	}
 	if originRoot == nil {
-		return t.rejectAbsentJournalObjectLocked(event, expected, result)
+		return t.rejectAbsentJournalObjectLocked(event, expected)
 	}
 	defer func() { retErr = errors.Join(retErr, originRoot.Close()) }()
 	kindRoot, err := openOptionalFolderSubroot(originRoot, string(event.Kind), "kind")
@@ -112,12 +112,12 @@ func (t *folderTransport) pullJournalEventLocked(
 		return err
 	}
 	if kindRoot == nil {
-		return t.rejectAbsentJournalObjectLocked(event, expected, result)
+		return t.rejectAbsentJournalObjectLocked(event, expected)
 	}
 	defer func() { retErr = errors.Join(retErr, kindRoot.Close()) }()
 	info, err := kindRoot.Lstat(event.Name)
 	if errors.Is(err, fs.ErrNotExist) {
-		return t.rejectAbsentJournalObjectLocked(event, expected, result)
+		return t.rejectAbsentJournalObjectLocked(event, expected)
 	}
 	if err != nil {
 		return err
@@ -139,14 +139,12 @@ func (t *folderTransport) pullJournalEventLocked(
 }
 
 // rejectAbsentJournalObjectLocked handles a journal entry whose object is not
-// in the target, for example after an interrupted publication, a peer
-// quarantine, or a partial copy of the folder. The reader leaves a rejection
-// marker so the origin's repair pass re-journals the object, and advances past
-// the entry instead of failing every later exchange.
+// in the target, for example after a partial copy of the folder. The reader
+// leaves a rejection marker, which makes the origin restore and re-journal the
+// object, and advances past the entry instead of failing every later exchange.
 func (t *folderTransport) rejectAbsentJournalObjectLocked(
 	event folderJournalEvent,
 	expected Identity,
-	result *ExchangeResult,
 ) (retErr error) {
 	originRoot, err := t.ensureFolderSubrootLocked(t.root, event.Origin, "origin")
 	if err != nil {
@@ -180,17 +178,19 @@ func (t *folderTransport) rejectAbsentJournalObjectLocked(
 	case validationErr == nil:
 		// A reader already quarantined this object and recorded why.
 		return nil
-	case errors.Is(validationErr, fs.ErrNotExist):
-		result.Missing++
-	case errors.Is(validationErr, ErrArtifactInvalid):
+	case errors.Is(validationErr, fs.ErrNotExist),
+		errors.Is(validationErr, ErrArtifactInvalid):
 	default:
 		return validationErr
 	}
-	return t.writeFolderJournalRejectionLocked(
+	if err := t.writeFolderJournalRejectionLocked(
 		kindRoot,
 		event.Name,
 		expected,
-	)
+	); err != nil {
+		return err
+	}
+	return t.markFolderRejectionsPendingLocked(event.Origin)
 }
 
 func (t *folderTransport) pullRootEntryLocked(
@@ -361,6 +361,7 @@ func (t *folderTransport) pullWireEntryLocked(
 			errors.Is(decodeErr, ErrArtifactInvalid) {
 			err := t.rejectFolderEntryLocked(
 				kindRoot,
+				origin,
 				entry.Name(),
 				expected,
 			)
@@ -375,6 +376,7 @@ func (t *folderTransport) pullWireEntryLocked(
 		if errors.Is(err, ErrArtifactInvalid) {
 			quarantineErr := t.rejectFolderEntryLocked(
 				kindRoot,
+				origin,
 				entry.Name(),
 				expected,
 			)
@@ -542,11 +544,15 @@ func (t *folderTransport) QuarantineTransportArtifact(
 	); err != nil {
 		return err
 	}
+	if err := t.markFolderRejectionsPendingLocked(ref.Origin); err != nil {
+		return err
+	}
 	return t.quarantineFolderEntryLocked(kindRoot, wire.Name)
 }
 
 func (t *folderTransport) rejectFolderEntryLocked(
 	root *os.Root,
+	origin string,
 	name string,
 	expected *Identity,
 ) error {
@@ -556,6 +562,9 @@ func (t *folderTransport) rejectFolderEntryLocked(
 			name,
 			*expected,
 		); err != nil {
+			return err
+		}
+		if err := t.markFolderRejectionsPendingLocked(origin); err != nil {
 			return err
 		}
 	}
